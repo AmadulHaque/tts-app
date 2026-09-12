@@ -12,6 +12,24 @@ if _PROJECT_ROOT not in sys.path:
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
 
+import traceback
+
+from app.utils.logger import setup_logger
+
+
+def _crash_hook(exc_type, exc_value, exc_tb) -> None:
+    """Log uncaught exceptions before the interpreter dies."""
+    try:
+        setup_logger().critical(
+            "Unhandled exception:\n%s",
+            "".join(traceback.format_exception(exc_type, exc_value, exc_tb)))
+    except Exception:  # noqa: BLE001
+        pass
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+
+sys.excepthook = _crash_hook
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
