@@ -21,7 +21,9 @@ fi
 UV_PYTHON=.venv/bin/python uv pip install --upgrade -e '.[dev]' pyinstaller || true
 
 echo "-> building with PyInstaller (this can take several minutes)…"
+rm -rf "${PROJECT_ROOT}/dist"   # stale onefile EXE / old bundles collide with the .app name
 UV_PYTHON=.venv/bin/python "${PY}" -m PyInstaller --clean --noconfirm kokoro-studio.spec
+rm -rf "${PROJECT_ROOT}/dist/Kokoro Studio"   # intermediate COLLECT dir; the .app has everything
 
 echo
 echo "Done. App bundle:"

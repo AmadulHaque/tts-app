@@ -1,588 +1,255 @@
-"""Main window: tab shell, menus, engine lifecycle, generation orchestration."""
+"""Kokoro Studio — simple text-to-speech window.
+
+Type text, pick a voice, hit Generate & Save. Nothing else.
+"""
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
-from PySide6.QtCore import QThread, QTimer, Qt
-from PySide6.QtGui import QAction, QKeySequence, QPalette
+from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
 from PySide6.QtWidgets import (
-    QApplication, QFileDialog, QLabel, QMainWindow, QMenu, QMessageBox,
-    QTabWidget,
+    QApplication, QComboBox, QDoubleSpinBox, QFileDialog, QHBoxLayout,
+    QLabel, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
+    QVBoxLayout, QWidget,
 )
 
 from .. import APP_NAME, __version__
-from ..core.batch_runner import EngineLoader, GenerationWorker, PreviewRunner, run_worker_thread
-from ..core.project import Project
+from ..core import audio_processor
 from ..core.tts_engine import TTSEngine
-from ..models.dialogue import SpeakerProfile
 from ..models.voice import VOICE_CATALOG
-from ..utils import paths  # noqa: F401
-from ..utils.config import Settings, add_recent_file, load_recent_files, load_settings
+from ..utils import paths
 from ..utils.logger import get_logger, setup_logger
-from .about_tab import AboutTab
-from .batch_generator import BatchGeneratorTab
-from .dialogue_editor import DialogueEditorTab
-from .settings_tab import SettingsTab
-from .voice_library import VoiceLibraryTab
+from .widgets.busy import clear_busy, set_busy
 from .widgets.preview import AudioPreviewer
 
 log = get_logger("main_window")
 
-PREVIEW_TEXT = "Hi there! This is a quick preview of my voice."
-
-# Threads that outlive their window (close during a blocking run): kept here so
-# the wrapper is never GC'd while running; each thread's finished handler
-# discards it. Destroying a running QThread is SIGABRT.
+# Threads that outlive their window: keep a reference so a running QThread is
+# never GC'd (that is a hard abort).
 _ORPHAN_THREADS: set = set()
 
 
-def _shutdown_thread(thread, timeout_ms: int) -> None:
-    """Ask *thread* to quit and wait. Stash survivors in _ORPHAN_THREADS."""
-    if thread is None:
-        return
-    thread.quit()
-    try:
-        done = thread.wait(timeout_ms)
-    except RuntimeError:
-        return  # already deleted
-    try:
-        alive = thread.isRunning()
-    except RuntimeError:
-        return
-    if not done and alive:
-        _ORPHAN_THREADS.add(thread)
+class SynthWorker(QObject):
+    """Synthesize text on a background thread; emits numpy audio."""
+
+    finished_audio = Signal(object)   # np.ndarray float32 @24k
+    failed = Signal(str)
+
+    def __init__(self, engine: TTSEngine, text: str, voice_id: str,
+                 speed: float = 1.0, pitch: float = 0.0,
+                 parent: QObject | None = None):
+        super().__init__(parent)
+        self._engine = engine
+        self._text = text
+        self._voice_id = voice_id
+        self._speed = speed
+        self._pitch = pitch
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            audio = self._engine.synthesize(self._text, self._voice_id,
+                                            speed=self._speed)
+            if self._pitch:
+                audio = audio_processor.pitch_shift(audio, self._pitch)
+            self.finished_audio.emit(audio_processor.peak_normalize(audio))
+        except Exception as e:  # noqa: BLE001
+            log.exception("Synthesis failed")
+            self.failed.emit(str(e))
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, settings: Settings | None = None):
+    def __init__(self):
         super().__init__()
-        self._settings = settings or load_settings()
-        setup_logger(self._settings.log_level)
-        self.current_project = self._default_project()
-        self._current_file: str | None = None
-        self._gen_worker: GenerationWorker | None = None
-        self._gen_thread: QThread | None = None
-        self._engine_thread: QThread | None = None
-        self._engine_loader = None  # EngineLoader; held: dead receivers silently disconnect
-        self._preview_workers: set = set()
-        self._preview_threads: set[QThread] = set()
+        setup_logger("INFO")
+        self._engine = TTSEngine()
+        self._worker: SynthWorker | None = None
+        self._thread: QThread | None = None
+        self._pending_audio = None
         self._previewer = AudioPreviewer()
-        self._preview_gen = 0
-        self._pending_preview: tuple[str, str] | None = None
-
-        # Engine (lazy: loads in a background thread at startup)
-        self._engine = TTSEngine(model_repo_id=self._settings.model_repo_id,
-                                 device=self._settings.device)
 
         self.setWindowTitle(f"{APP_NAME} {__version__}")
-        self.resize(1280, 820)
+        self.resize(720, 520)
 
-        self._build_tabs()
-        self._build_menus()
-        self._build_statusbar()
-        self._wire_signals()
-        self._apply_theme(self._settings.theme)
-        self._show_status(f"Ready — engine loading…")
+        central = QWidget()
+        layout = QVBoxLayout(central)
 
-        self._init_engine_thread()
-        QTimer.singleShot(0, self._maybe_offer_recovery)
+        self.text_edit = QPlainTextEdit()
+        self.text_edit.setPlaceholderText(
+            "Paste your script here, pick a voice, then click Generate & Save Audio.")
+        layout.addWidget(self.text_edit, 1)
 
-    # ------------------------------------------------------------------ setup
+        row = QWidget()
+        row_layout = QVBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
 
-    def _default_project(self) -> Project:
-        s = self._settings
-        p = Project(title="Untitled Project")
-        p.speakers = [
-            SpeakerProfile("Speaker A", s.default_voice_a, s.default_speed_a),
-            SpeakerProfile("Speaker B", s.default_voice_b, s.default_speed_b),
-        ]
-        p.pause_between_lines = s.pause_between_lines
-        p.pause_between_speakers = s.pause_between_speakers
-        p.output_format = s.output_format
-        p.sample_rate = s.sample_rate
-        p.normalize = s.normalize
-        p.peak_target_db = s.peak_target_db
-        p.lufs_target = s.lufs_target
-        p.output_dir = s.output_dir
-        return p
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Voice:"))
+        self.voice_combo = QComboBox()
+        for vid in sorted(VOICE_CATALOG):
+            info = VOICE_CATALOG[vid]
+            self.voice_combo.addItem(f"{info.name} ({vid}) · {info.accent}", vid)
+        controls.addWidget(self.voice_combo, 2)
 
-    def _build_tabs(self) -> None:
-        from ..core.batch_runner import BatchRunner
-        self._batch_runner = BatchRunner(self._engine)
+        controls.addWidget(QLabel("Speed:"))
+        self.speed_spin = QDoubleSpinBox()
+        self.speed_spin.setRange(0.5, 1.5)
+        self.speed_spin.setSingleStep(0.05)
+        self.speed_spin.setDecimals(2)
+        self.speed_spin.setValue(1.0)
+        self.speed_spin.setFixedWidth(70)
+        self.speed_spin.setToolTip("Speaking rate (0.5 – 1.5×)")
+        controls.addWidget(self.speed_spin)
 
-        self.tabs = QTabWidget()
-        self.editor = DialogueEditorTab()
-        self.library = VoiceLibraryTab()
-        self.batch_tab = BatchGeneratorTab(self._batch_runner)
-        self.settings_tab = SettingsTab(self._settings)
-        self.about = AboutTab()
+        controls.addWidget(QLabel("Pitch:"))
+        self.pitch_spin = QDoubleSpinBox()
+        self.pitch_spin.setRange(-2.0, 2.0)
+        self.pitch_spin.setSingleStep(0.1)
+        self.pitch_spin.setDecimals(1)
+        self.pitch_spin.setValue(0.0)
+        self.pitch_spin.setSuffix(" st")
+        self.pitch_spin.setFixedWidth(70)
+        self.pitch_spin.setToolTip("Pitch shift in semitones (-2 – +2, needs ffmpeg)")
+        controls.addWidget(self.pitch_spin)
 
-        self.tabs.addTab(self.editor, "📝 Dialogue Editor")
-        self.tabs.addTab(self.library, "🎙️ Voice Library")
-        self.tabs.addTab(self.batch_tab, "📦 Batch Generator")
-        self.tabs.addTab(self.settings_tab, "⚙️ Settings")
-        self.tabs.addTab(self.about, "ℹ️ About")
-        self.setCentralWidget(self.tabs)
+        controls.addStretch(1)
+        row_layout.addLayout(controls)
 
-    # ------------------------------------------------------------------ menus
+        self.generate_btn = QPushButton("🔊 Generate Audio")
+        self.generate_btn.setObjectName("primaryButton")
+        self.generate_btn.setMinimumHeight(40)
+        row_layout.addWidget(self.generate_btn)
 
-    def _build_menus(self) -> None:
-        mb = self.menuBar()
+        play_row = QHBoxLayout()
+        self.play_btn = QPushButton("▶ Play")
+        self.play_btn.setEnabled(False)
+        self.play_btn.setToolTip("Replay the generated audio")
+        self.stop_btn = QPushButton("⏹ Stop")
+        self.stop_btn.setEnabled(False)
+        self.save_btn = QPushButton("💾 Save Audio")
+        self.save_btn.setObjectName("primaryButton")
+        self.save_btn.setEnabled(False)
+        self.save_btn.setMinimumHeight(34)
+        play_row.addWidget(self.play_btn)
+        play_row.addWidget(self.stop_btn)
+        play_row.addStretch(1)
+        play_row.addWidget(self.save_btn)
+        row_layout.addLayout(play_row)
 
-        file_menu = mb.addMenu("&File")
-        self.act_new = self._action("&New Project", "Ctrl+N", self.new_project, file_menu)
-        self.act_open = self._action("&Open…", "Ctrl+O", self.open_project, file_menu)
-        self.act_save = self._action("&Save", "Ctrl+S", self.save_project, file_menu)
-        self.act_save_as = self._action("Save &As…", "Ctrl+Shift+S", self.save_project_as, file_menu)
-        self.recent_menu = QMenu("Recent Files", self)
-        file_menu.addMenu(self.recent_menu)
-        file_menu.addSeparator()
-        self._action("E&xit", "Ctrl+Q", self.close, file_menu)
+        layout.addWidget(row)
+        self.setCentralWidget(central)
 
-        edit_menu = mb.addMenu("&Edit")
-        self._action("Undo", "Ctrl+Z", self.editor.undo, edit_menu)
-        self._action("Redo", "Ctrl+Shift+Z", self.editor.redo, edit_menu)
-        edit_menu.addSeparator()
-        self._action("Add Line", "Ctrl+Enter", self.editor.add_line, edit_menu)
-        self._action("Duplicate Line", None, self.editor.duplicate_selected, edit_menu)
-        self._action("Delete Line", None, self.editor.delete_selected, edit_menu)
-        edit_menu.addSeparator()
-        self._action("Import Dialogue…", None, self.editor.import_dialog, edit_menu)
-        self._action("Export Dialogue…", None, self.editor.export_dialog, edit_menu)
+        self._status = QLabel("Ready")
+        self.statusBar().addWidget(self._status, 1)
 
-        voices_menu = mb.addMenu("&Voices")
-        self._action("Show Voice Library", "Ctrl+L", lambda: self.tabs.setCurrentWidget(self.library), voices_menu)
-        self._action("Set Speaker A voice…", None, lambda: self._pick_speaker_voice("A"), voices_menu)
-        self._action("Set Speaker B voice…", None, lambda: self._pick_speaker_voice("B"), voices_menu)
-        voices_menu.addSeparator()
-        self.rebuild_voices_action = self._action("Rebuild Default Voices", "Ctrl+R", self._rebuild_default_voices, voices_menu)
+        self.generate_btn.clicked.connect(self._on_generate)
+        self.play_btn.clicked.connect(self._on_play)
+        self.stop_btn.clicked.connect(self._previewer.stop)
+        self.save_btn.clicked.connect(self._on_save)
 
-        batch_menu = mb.addMenu("&Batch")
-        self._action("Open Batch Mode", "Ctrl+B", lambda: self.tabs.setCurrentWidget(self.batch_tab), batch_menu)
-        self._action("Generate All", "Ctrl+G", self.batch_tab.gen_all_btn.click,
-                     batch_menu)
+        self._apply_qss("dark")
 
-        help_menu = mb.addMenu("&Help")
-        self._action("Keyboard Shortcuts…", None, self._show_shortcuts, help_menu)
-        self._action(f"About {APP_NAME}…", None, lambda: self.tabs.setCurrentWidget(self.about), help_menu)
+    # -- generation ---------------------------------------------------------
 
-        self.rebuild_recent_menu()
-
-    def _action(self, text: str, shortcut: str | None, slot, menu: QMenu) -> QAction:
-        act = QAction(text, self)
-        if shortcut:
-            act.setShortcut(QKeySequence(shortcut))
-        act.triggered.connect(slot)
-        menu.addAction(act)
-        return act
-
-    # ------------------------------------------------------------- status bar
-
-    def _build_statusbar(self) -> None:
-        sb = self.statusBar()
-        self._sb_msg = QLabel("Ready")
-        self._sb_len = QLabel("Audio length: 00:00")
-        self._sb_gpu = QLabel("GPU: —")
-        sb.addWidget(self._sb_msg, 1)
-        sb.addPermanentWidget(self._sb_len)
-        sb.addPermanentWidget(self._sb_gpu)
-
-    def _show_status(self, message: str, timeout: int = 0) -> None:
-        self._sb_msg.setText(message)
-        if timeout:
-            self.statusBar().showMessage("", timeout)
-
-    def _set_audio_length(self, seconds: float) -> None:
-        m, s = divmod(int(seconds), 60)
-        self._sb_len.setText(f"Audio length: {m}:{s:02d}")
-
-    # ----------------------------------------------------------------- signals
-
-    def _wire_signals(self) -> None:
-        e = self.editor
-        e.generate_requested.connect(self._on_generate)
-        e.cancel_requested.connect(self._cancel_generation)
-        e.save_requested.connect(self.save_project)
-        e.preview_line.connect(self._preview_line)
-        e.status_message.connect(self._show_status)
-        e.preview_sample.connect(self._preview_sample)
-        e.project_modified.connect(lambda: self._sb_msg.setText("Project modified"))
-
-        self.library.preview_requested.connect(self._preview_voice)
-        self.library.set_default_requested.connect(self._on_set_default_voice)
-        self.library.status_message.connect(self._show_status)
-        self.batch_tab.status_message.connect(self._show_status)
-        self.settings_tab.settings_saved.connect(self._on_settings_saved)
-        self.settings_tab.theme_changed.connect(self._apply_theme)
-        self.settings_tab.status_message.connect(self._show_status)
-
-    # ------------------------------------------------------------- engine init
-
-    def _init_engine_thread(self) -> None:
-        # The thread must be held on self: a collected-while-running QThread
-        # is a hard abort (SIGABRT in QThread::~QThread). Locals die with this
-        # frame, so never store the loader thread in a local.
-        if self._engine_thread is not None:
+    def _on_generate(self) -> None:
+        text = self.text_edit.toPlainText().strip()
+        if not text:
+            self._status.setText("Type some text first.")
             return
-        loader = EngineLoader(self._engine)
-        thread = QThread()
-        self._engine_thread = thread
-        self._engine_loader = loader
-        loader.moveToThread(thread)
-        thread.started.connect(loader.run)
-        loader.ready.connect(self._on_engine_ready)
-        loader.ready.connect(thread.quit)
-        loader.ready.connect(loader.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(self._clear_engine_thread)
-        thread.finished.connect(lambda t=thread: _ORPHAN_THREADS.discard(t))
-        thread.start()
-
-    def _clear_engine_thread(self) -> None:
-        self._engine_thread = None
-        self._engine_loader = None
-
-    def _on_engine_ready(self, ok: bool, message: str) -> None:
-        if ok:
-            self._sb_gpu.setText(f"GPU: {message}")
-            self._show_status(f"Ready — engine running on {message}")
-        else:
-            self._sb_gpu.setText("GPU: —")
-            self._show_status(f"Engine failed to start: {message}")
-
-    def _maybe_offer_recovery(self) -> None:
-        """Offer to restore the newest autosave (crash recovery, spec F5)."""
-        try:
-            autosaves = sorted(paths.autosave_dir().glob("*.autosave.kstudio"),
-                               key=lambda p: p.stat().st_mtime, reverse=True)
-        except OSError:
+        if self._thread is not None:
+            self._status.setText("Already generating — one moment.")
             return
-        if not autosaves:
-            return
-        newest = autosaves[0]
-        ret = QMessageBox.question(
-            self, "Recover autosave?",
-            f"Found an autosave from a previous session:\n{newest.name}\n\nRestore it?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No)
-        if ret == QMessageBox.StandardButton.Yes:
-            self._load_project(str(newest))
 
-    # -------------------------------------------------------------- generation
-
-    def _on_generate(self, project: Project) -> None:
-        if not self._engine.ready:
-            self._show_status("Kokoro is still loading — wait a moment then try again.")
-            self.editor.generation_finished()
-            return
-        out = project.default_output_path()
-        srt = out.with_suffix(".srt")
-        worker = GenerationWorker(project, self._engine, str(out), srt_path=str(srt))
-        thread = run_worker_thread(worker)
-        self._gen_worker, self._gen_thread = worker, thread
-
-        worker.progress.connect(self.editor.set_generation_progress)
-        worker.line_done.connect(self._on_line_done)
-        worker.error.connect(lambda msg: (self._show_status(f"Generation failed: {msg}"),
-                                          QMessageBox.warning(self, "Generation failed", msg)))
-        worker.finished.connect(self._on_generation_finished)
-        worker.cancelled.connect(self._on_generation_cancelled)
-
-    def _on_line_done(self, _index: int, speaker: str) -> None:
-        self._show_status(f"Generated line for {speaker}…")
-
-    def _on_generation_finished(self, path: str) -> None:
-        self.editor.generation_finished()
-        if not path:
-            return
-        p = Path(path)
-        try:
-            import soundfile as sf
-            info = sf.info(str(p))
-            self._set_audio_length(info.frames / info.samplerate)
-            self._previewer.play_file(p)
-        except Exception:  # noqa: BLE001
-            pass
-        self._show_status(f"Saved to {p.name}  ·  SRT written alongside")
-
-    def _on_generation_cancelled(self) -> None:
-        self.editor.generation_finished()
-        self._show_status("Generation cancelled")
-
-    def _cancel_generation(self) -> None:
-        if self._gen_worker is not None:
-            self._gen_worker.cancel()
-
-    # --------------------------------------------------------------- preview
-
-    def _preview_line(self, row: int) -> None:
-        if not self._engine.ready:
-            self._show_status("Engine still loading — try again in a moment.")
-            return
-        project = self.editor.snapshot_project()
-        if row < 0 or row >= len(project.lines):
-            return
-        line = project.lines[row]
-        prof = project.speaker(line.speaker)
-        if prof is None:
-            prof = project.add_speaker_if_missing(line.speaker)
-        speed = line.speed if line.speed is not None else prof.speed
-        pitch = line.pitch if line.pitch is not None else prof.pitch
-        self._spawn_preview(line.text, prof.voice_id, speed, pitch)
-
-    def _preview_sample(self, voice_id: str, text: str, speed: float, pitch: float) -> None:
-        if not self._engine.ready:
-            self._show_status("Engine still loading — try again in a moment.")
-            return
-        self._spawn_preview(text or PREVIEW_TEXT, voice_id, speed, pitch)
-
-    def _preview_voice(self, voice_id: str) -> None:
-        if not self._engine.ready:
-            self._show_status("Engine still loading — try again in a moment.")
-            return
-        self._spawn_preview(PREVIEW_TEXT, voice_id, 1.0, 0.0, source="library")
-
-    def _spawn_preview(self, text: str, voice_id: str, speed: float, pitch: float,
-                       source: str = "editor") -> None:
+        voice_id = self.voice_combo.currentData() or "af_heart"
+        speed = float(self.speed_spin.value())
+        pitch = float(self.pitch_spin.value())
+        set_busy(self.generate_btn, "⏳ Generating")
         self._previewer.stop()
-        self._clear_preview_busy()
-        self._preview_gen += 1
-        gen = self._preview_gen
-        self._pending_preview = (source, voice_id)
-        if source == "library":
-            self.library.set_preview_busy(voice_id, True)
-        else:
-            self.editor.set_preview_busy(True)
+        self._pending_audio = None
+        self.play_btn.setEnabled(False)
+        self.stop_btn.setEnabled(False)
+        self.save_btn.setEnabled(False)
+        self._status.setText("Generating audio (first run loads the model)…")
 
-        worker = PreviewRunner(self._engine, text, voice_id, speed, pitch)
+        worker = SynthWorker(self._engine, text, voice_id, speed, pitch)
         thread = QThread()
-        self._preview_threads.add(thread)  # see _init_engine_thread: never GC a running QThread
-        self._preview_workers.add(worker)  # dead receivers silently disconnect: never GC a queued worker
+        self._worker, self._thread = worker, thread
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.completed.connect(lambda audio, g=gen: self._on_preview_audio(audio, g))
-        worker.failed.connect(lambda err, g=gen: self._on_preview_failed(err, g))
-        for sig in (worker.completed, worker.failed):
+        worker.finished_audio.connect(self._on_audio)
+        worker.failed.connect(self._on_failed)
+        for sig in (worker.finished_audio, worker.failed):
             sig.connect(thread.quit)
-            sig.connect(worker.deleteLater)
-        worker.completed.connect(lambda _audio: self._preview_workers.discard(worker))
-        worker.failed.connect(lambda _err: self._preview_workers.discard(worker))
+        thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(lambda t=thread: self._preview_threads.discard(t))
-        thread.finished.connect(lambda t=thread: _ORPHAN_THREADS.discard(t))
+        thread.finished.connect(self._clear_thread)
         thread.start()
 
-    def _on_preview_audio(self, audio, gen: int = -1) -> None:
-        if gen >= 0 and gen != self._preview_gen:
-            return  # stale worker: a newer preview already took over
-        self._clear_preview_busy()
+    def _on_audio(self, audio) -> None:
+        clear_busy(self.generate_btn)
+        self._pending_audio = audio
+        self.play_btn.setEnabled(True)
+        self.stop_btn.setEnabled(True)
+        self.save_btn.setEnabled(True)
+        seconds = audio_processor.duration_seconds(audio)
+        self._status.setText(f"Generated {seconds:.1f}s — playing. Click Save Audio to keep it.")
         self._previewer.play_array(audio)
-        self._set_audio_length(len(audio) / 24000.0)
 
-    def _on_preview_failed(self, error: str, gen: int = -1) -> None:
-        if gen >= 0 and gen != self._preview_gen:
-            return
-        self._clear_preview_busy()
-        self._show_status(f"Preview failed: {error}")
+    def _on_play(self) -> None:
+        if self._pending_audio is not None:
+            self._previewer.play_array(self._pending_audio)
 
-    def _clear_preview_busy(self) -> None:
-        if self._pending_preview is None:
+    def _on_save(self) -> None:
+        if self._pending_audio is None:
             return
-        source, voice_id = self._pending_preview
-        self._pending_preview = None
-        if source == "library":
-            self.library.set_preview_busy(voice_id, False)
-        else:
-            self.editor.set_preview_busy(False)
+        out_dir = paths.resolve_output_dir("")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save audio", str(out_dir / self._suggest_name()),
+            "WAV (*.wav);;MP3 (*.mp3);;FLAC (*.flac);;OGG (*.ogg)")
+        if not path:
+            self._status.setText("Save cancelled — audio still available.")
+            return
+        fmt = Path(path).suffix.lstrip(".").upper() or "WAV"
+        try:
+            target = audio_processor.export(self._pending_audio, path, fmt)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.warning(self, "Save failed", str(e))
+            self._status.setText("Save failed.")
+            return
+        seconds = audio_processor.duration_seconds(self._pending_audio)
+        self._status.setText(f"Saved {target.name}  ·  {seconds:.1f}s")
+
+    def _on_failed(self, error: str) -> None:
+        clear_busy(self.generate_btn)
+        self._status.setText(f"Generation failed: {error}")
+        QMessageBox.warning(self, "Generation failed", error)
+
+    def _suggest_name(self) -> str:
+        words = [w for w in self.text_edit.toPlainText().split() if w][:4]
+        stem = " ".join(words) if words else "speech"
+        keep = "".join(c for c in stem if c.isalnum() or c in " _-").strip() or "speech"
+        return f"{keep}.wav"
+
+    def _clear_thread(self) -> None:
+        self._worker = None
+        self._thread = None
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self._previewer.stop()
-        if self._gen_worker is not None:
-            self._gen_worker.cancel()
-        _shutdown_thread(self._gen_thread, 5000)
-        for t in list(self._preview_threads):
-            _shutdown_thread(t, 2000)
-        self._preview_threads.clear()
-        self._preview_workers.clear()
-        _shutdown_thread(self._engine_thread, 5000)
-        self._engine_thread = None
-        self._engine_loader = None
+        if self._thread is not None:
+            self._thread.quit()
+            if not self._thread.wait(3000):
+                _ORPHAN_THREADS.add(self._thread)
+        self._thread = None
+        self._worker = None
         super().closeEvent(event)
 
-    # -------------------------------------------------------- project actions
+    # -- appearance -----------------------------------------------------------
 
-    def new_project(self) -> None:
-        if self._confirm_discard():
-            self.current_project = self._default_project()
-            self._current_file = None
-            self.editor.set_project(self.current_project)
-            self.setWindowTitle(f"{APP_NAME} {__version__} — Untitled Project")
-            self._show_status("New project")
-
-    def open_project(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Open project", str(Path.home()), "Kokoro Studio projects (*.kstudio)")
-        if path:
-            self._load_project(path)
-
-    def _load_project(self, path: str) -> None:
+    def _apply_qss(self, kind: str) -> None:
+        path = Path(__file__).parent / ".." / "assets" / "styles" / f"app_{kind}.qss"
         try:
-            project = Project.load(path)
-        except Exception as e:  # noqa: BLE001
-            QMessageBox.warning(self, "Open failed", str(e))
-            return
-        self.current_project = project
-        self._current_file = path
-        self.editor.set_project(project)
-        self.setWindowTitle(f"{APP_NAME} {__version__} — {project.title}")
-        add_recent_file(path)
-        self.rebuild_recent_menu()
-        self._show_status(f"Opened {Path(path).name}")
-
-    def save_project(self) -> None:
-        if self._current_file:
-            self._do_save(self._current_file)
-        else:
-            self.save_project_as()
-
-    def save_project_as(self) -> None:
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save project", str(Path.home() / "Untitled Project.kstudio"),
-            "Kokoro Studio projects (*.kstudio)")
-        if path:
-            self._do_save(path)
-
-    def _do_save(self, path: str) -> None:
-        project = self.editor.snapshot_project()
-        project.save(path)
-        self._current_file = str(path)
-        self.current_project = project
-        self.setWindowTitle(f"{APP_NAME} {__version__} — {project.title}")
-        add_recent_file(path)
-        self.rebuild_recent_menu()
-        self._show_status(f"Saved {Path(path).name}")
-
-    def rebuild_recent_menu(self) -> None:
-        self.recent_menu.clear()
-        for p in load_recent_files()[:8]:
-            act = QAction(p, self)
-            act.triggered.connect(lambda _=False, path=p: self._load_project(path))
-            self.recent_menu.addAction(act)
-        if not self.recent_menu.actions():
-            self.recent_menu.addAction("(no recent files)").setEnabled(False)
-
-    def export_srt(self) -> None:
-        """SRT is written alongside generated audio (see _on_generate)."""
-        self._show_status("SRT subtitles are written next to each generated audio file.")
-
-    def _confirm_discard(self) -> bool:
-        try:
-            lines = self.editor.snapshot_project().lines
-        except Exception:  # noqa: BLE001
-            lines = self.current_project.lines
-        if not any(line.text.strip() for line in lines):
-            return True
-        ret = QMessageBox.question(
-            self, "New project",
-            "Discard the current dialogue and start a new project?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No)
-        return ret == QMessageBox.StandardButton.Yes
-
-    # ------------------------------------------------------------- voices menu
-
-    def _pick_speaker_voice(self, which: str) -> None:
-        from PySide6.QtWidgets import QInputDialog
-        choices = sorted(VOICE_CATALOG)
-        voice_id, ok = QInputDialog.getItem(self, f"Set Speaker {which} voice",
-                                            "Voice:", choices, 0, False)
-        if ok and voice_id:
-            self._on_set_default_voice(voice_id, which)
-
-    def _on_set_default_voice(self, voice_id: str, which: str) -> None:
-        s = self._settings
-        if which == "A":
-            s.default_voice_a = voice_id
-        else:
-            s.default_voice_b = voice_id
-        s.save()
-        # Push into the current editor panel.
-        a, b = self.editor.voice_panel.profiles()
-        if which == "A":
-            a = SpeakerProfile(a.name, voice_id, a.speed, a.pitch)
-        else:
-            b = SpeakerProfile(b.name, voice_id, b.speed, b.pitch)
-        self.editor.voice_panel.set_profiles(a, b)
-        self.current_project.speakers = [a, b]
-        self._show_status(f"Speaker {which} default voice set to {voice_id}")
-
-    def _rebuild_default_voices(self) -> None:
-        s = self._settings
-        a, b = self.editor.voice_panel.profiles()
-        s.default_voice_a = a.voice_id
-        s.default_voice_b = b.voice_id
-        s.default_speed_a = a.speed
-        s.default_speed_b = b.speed
-        s.save()
-        self._show_status("Default voices updated from current panel")
-
-    # --------------------------------------------------------- settings hooks
-
-    def _on_settings_saved(self, settings: Settings) -> None:
-        old = self._settings
-        self._settings = settings
-        recreate = (settings.model_repo_id != old.model_repo_id or settings.device != old.device)
-        if recreate:
-            from ..core.tts_engine import set_engine
-            set_engine(None)
-            self._engine = TTSEngine(model_repo_id=settings.model_repo_id,
-                                      device=settings.device)
-            self._batch_runner.set_engine(self._engine)
-        self._init_engine_thread()
-        QTimer.singleShot(0, self._maybe_offer_recovery)
-        self._apply_theme(settings.theme)
-        self._show_status("Settings saved")
-
-    # --------------------------------------------------------------- theming
-
-    def _apply_theme(self, theme: str) -> None:
-        theme = theme or "dark"
-        if theme == "system":
-            theme = self._detect_system_theme()
-        resource = "dark" if theme == "dark" else "light"
-        qss = _load_qss(resource)
-        if qss:
-            QApplication.instance().setStyleSheet(qss)
-        self._current_theme = theme
-
-    def _detect_system_theme(self) -> str:
-        try:
-            from PySide6.QtGui import QColor
-            w = QApplication.instance().palette().color(QPalette.ColorRole.Window)
-            return "dark" if w.lightness() < 128 else "light"
-        except Exception:  # noqa: BLE001
-            return "dark"
-
-    def _show_shortcuts(self) -> None:
-        QMessageBox.information(self, "Keyboard shortcuts",
-            "Ctrl+N  New project\n"
-            "Ctrl+O  Open project\n"
-            "Ctrl+S  Save\n"
-            "Ctrl+Shift+S  Save As\n"
-            "Ctrl+G  Generate (Batch: Generate All)\n"
-            "Ctrl+L  Voice Library\n"
-            "Ctrl+B  Batch mode\n"
-            "Ctrl+Enter  Add line\n"
-            "Space  Preview selected line\n"
-            "Ctrl+Z / Ctrl+Shift+Z  Undo / Redo\n"
-            "Ctrl+Q  Quit")
-
-
-def _load_qss(kind: str) -> str:
-    path = Path(__file__).parent / ".." / "assets" / "styles" / f"app_{kind}.qss"
-    try:
-        return path.resolve().read_text(encoding="utf-8")
-    except OSError:
-        return ""
+            QApplication.instance().setStyleSheet(path.resolve().read_text(encoding="utf-8"))
+        except OSError:
+            pass

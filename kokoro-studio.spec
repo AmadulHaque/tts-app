@@ -53,16 +53,14 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,   # onedir: binaries live next to the EXE (required for .app)
     name="Kokoro Studio",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
     upx_exclude=[],
-    runtime_tmpdir=None,
     console=False,          # windowed app (no terminal on macOS)
     disable_windowed_traceback=False,
     argv_emulation=True,
@@ -72,9 +70,18 @@ exe = EXE(
     icon=None,              # TODO: point at an .icns for a custom app icon
 )
 
-app = BUNDLE(
+coll = COLLECT(
     exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=True,
     name="Kokoro Studio",
+)
+
+app = BUNDLE(
+    coll,
+    name="Kokoro Studio.app",
     icon=None,
     bundle_identifier="com.kokorostudio.app",
     info_plist={

@@ -1,7 +1,4 @@
-"""Offscreen GUI smoke test: the main window and all five tabs construct.
-
-The engine loader is stubbed so no torch/model download happens in tests.
-"""
+"""Offscreen smoke test: the simple TTS window constructs and is wired."""
 
 import os
 import pytest
@@ -19,58 +16,22 @@ def qapp():
     yield app
 
 
-def _patch_engine_loader(monkeypatch):
-    """Prevent the real EngineLoader from touching torch/downloads."""
-    from app.core import batch_runner as br
-    import types
-
-    def run(self):
-        self.ready.emit(True, "cpu-test")
-
-    monkeypatch.setattr(br.EngineLoader, "run", run)
-
-
-@pytest.fixture
-def window(qapp, monkeypatch):
-    """A MainWindow that is always closed (a window left running aborts
-    teardown: its engine QThread would be destroyed while still in exec)."""
-    _patch_engine_loader(monkeypatch)
+def test_window_constructs(qapp):
     from app.ui.main_window import MainWindow
-    from app.utils.config import Settings
 
-    win = MainWindow(Settings())
-    win.show()  # offscreen: makes isVisible() meaningful, renders nothing
-    yield win
+    win = MainWindow()
+    assert win.voice_combo.count() == 28
+    assert win.voice_combo.currentData()  # a real voice id
+    assert win.text_edit.toPlainText() == ""
+    assert win.generate_btn.isEnabled()
     win.close()
 
 
-def test_main_window_constructs(window):
-    assert window.tabs.count() == 5
-    assert window.editor.table is not None
-    assert window.library is not None
-    assert window.batch_tab is not None
-    assert window.settings_tab is not None
-    assert window.about is not None
+def test_empty_text_click_shows_hint(qapp):
+    from app.ui.main_window import MainWindow
 
-    # Undo stack + line ops round-trip through the table.
-    window.editor.add_line()
-    window.editor.project.lines[0].text = "Hello world"
-    assert len(window.editor.project.lines) == 1
-    window.editor.undo_stack.undo()
-    assert len(window.editor.project.lines) == 0
-    window.editor.undo_stack.redo()
-    assert len(window.editor.project.lines) == 1
-
-
-def test_voice_panel_defaults(window):
-    a, b = window.editor.voice_panel.profiles()
-    assert a.voice_id == "am_michael"
-    assert b.voice_id == "af_heart"
-
-
-def test_voice_library_grid(window):
-    assert len(window.library._cards) == 28
-    window.tabs.setCurrentWidget(window.library)  # stacked pages hide non-current tabs
-    window.library.gender_combo.setCurrentText("Female")
-    visible = [c for c in window.library._cards.values() if c.isVisible()]
-    assert len(visible) == 15
+    win = MainWindow()
+    win.generate_btn.click()
+    assert "Type some text" in win._status.text()
+    assert not win._status.text().startswith("Generating")
+    win.close()
