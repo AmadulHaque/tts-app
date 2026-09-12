@@ -24,6 +24,7 @@ from ..utils.config import load_settings
 from ..utils.import_export import import_file
 from . import commands as cmds
 from .voice_panel import VoicePanel
+from .widgets.busy import clear_busy, set_busy
 
 PAUSE_ROLE = Qt.ItemDataRole.UserRole + 1
 
@@ -172,6 +173,7 @@ class DialogueEditorTab(QWidget):
         self.save_btn.clicked.connect(self.save_requested)
         self.voice_panel.changed.connect(self._on_audio_changed)
         self.voice_panel.speakers_renamed.connect(self._on_speakers_renamed)
+        self.voice_panel.preview_requested.connect(self._on_preview_speaker)
         self.table.cellChanged.connect(lambda r, c: self._on_cell_changed(r, c))
         self.table.customContextMenuRequested.connect(self._context_menu)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -427,6 +429,13 @@ class DialogueEditorTab(QWidget):
         if row >= 0 and row < len(self.project.lines):
             self.preview_line.emit(row)
 
+    def _on_preview_speaker(self, name: str) -> None:
+        for prof in self.voice_panel.profiles():
+            if prof.name == name:
+                self.preview_sample.emit(prof.voice_id, "", prof.speed, prof.pitch)
+                return
+        self.status_message.emit(f"No speaker named “{name}” to preview")
+
     # -- import / export ------------------------------------------------------
 
     def import_dialog(self) -> None:
@@ -499,7 +508,7 @@ class DialogueEditorTab(QWidget):
             self.status_message.emit("Nothing to generate — add some dialogue lines first.")
             return
         self.generate_requested.emit(project)
-        self.generate_btn.setEnabled(False)
+        set_busy(self.generate_btn, "⏳ Generating")
         self.progress.setVisible(True)
         self.progress.setRange(0, 0)
         self.cancel_btn.setVisible(True)
@@ -509,9 +518,12 @@ class DialogueEditorTab(QWidget):
         self.progress.setValue(done)
 
     def generation_finished(self) -> None:
-        self.generate_btn.setEnabled(True)
+        clear_busy(self.generate_btn)
         self.progress.setVisible(False)
         self.cancel_btn.setVisible(False)
+
+    def set_preview_busy(self, busy: bool) -> None:
+        self.voice_panel.set_preview_busy(busy)
 
     def cancel_generation(self) -> None:
         self.cancel_requested.emit()  # type: ignore[attr-defined]

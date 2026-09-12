@@ -10,6 +10,7 @@ is testable without Qt)."""
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -34,6 +35,7 @@ def generate_project(
     output_path: str | Path,
     *,
     cancel_event: threading.Event | None = None,
+    pause_event: threading.Event | None = None,
     progress_cb: Callable[[int, int], None] | None = None,
     line_done_cb: Callable[[int, str], None] | None = None,
     srt_path: str | Path | None = None,
@@ -42,7 +44,8 @@ def generate_project(
 
     Returns {"path", "duration", "offsets"}. Raises InterruptedError on
     cancellation and RuntimeError/ValueError on failures. ``srt_path`` gets a
-    timing-accurate subtitle file written alongside."""
+    timing-accurate subtitle file written alongside. While ``pause_event``
+    is set the loop blocks between lines (resume-friendly)."""
 
     plan = project.render_plan()
     total = len(plan)
@@ -55,6 +58,7 @@ def generate_project(
     overrides: list[float | None] = []
 
     for step, item in enumerate(plan):
+        _wait_if_paused(pause_event, cancel_event)
         if cancel_event is not None and cancel_event.is_set():
             raise InterruptedError("Generation cancelled")
         audio = engine.synthesize(item["text"], item["voice_id"], item["speed"],
@@ -92,6 +96,17 @@ def generate_project(
 
     duration = audio_processor.duration_seconds(audio, sr)
     return {"path": str(out), "duration": duration, "offsets": offsets}
+
+
+def _wait_if_paused(pause_event: threading.Event | None,
+                    cancel_event: threading.Event | None) -> None:
+    """Block while paused; wake immediately on cancel."""
+    if pause_event is None:
+        return
+    while pause_event.is_set():
+        if cancel_event is not None and cancel_event.is_set():
+            return
+        time.sleep(0.1)
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +241,7 @@ class BatchRunner(QObject):
 
     item_progress = Signal(str, int, int)     # (name, done, total)
     item_status = Signal(str, str, str)       # (name, status, message)
+    paused_changed = Signal(bool)
     queue_finished = Signal()
 
     def __init__(self, engine: TTSEngine, parent: QObject | None = None):
@@ -264,21 +280,31 @@ class BatchRunner(QObject):
     def clear(self) -> None:
         self._items.clear()
 
-    def start(self) -> None:
+    def start(self, items: list[BatchItem] | None = None) -> None:
+        """Run the queue. ``items`` narrows the run to a subset (e.g. the
+        selected rows) without dropping anything from the queue."""
         if self.is_running():
+            return
+        run = list(items) if items else list(self._items)
+        if not run:
             return
         self._paused.clear()
         self._stop.clear()
         self._running.set()
-        self._worker = threading.Thread(target=self._process_queue, daemon=True,
-                                        name="kokoro-batch")
+        self._worker = threading.Thread(target=self._process_queue, args=(run,),
+                                        daemon=True, name="kokoro-batch")
         self._worker.start()
 
     def pause(self) -> None:
         self._paused.set()
+        self.paused_changed.emit(True)
 
     def resume(self) -> None:
         self._paused.clear()
+        self.paused_changed.emit(False)
+
+    def is_paused(self) -> bool:
+        return self._paused.is_set()
 
     def cancel_current(self) -> None:
         with self._current_lock:
@@ -296,15 +322,14 @@ class BatchRunner(QObject):
 
     # -- worker thread ----------------------------------------------------
 
-    def _process_queue(self) -> None:
+    def _process_queue(self, run: list[BatchItem]) -> None:
         try:
-            for item in list(self._items):
+            for item in run:
                 if self._stop.is_set():
                     break
-                while self._paused.is_set() and not self._stop.is_set():  # blocking pause
-                    if not item.cancel_event.wait(0.2):
-                        continue
-                    break
+                while self._paused.is_set() and not self._stop.is_set():
+                    if item.cancel_event.wait(0.2):
+                        break
                 if self._stop.is_set():
                     break
                 item.status = "Running"
@@ -325,6 +350,7 @@ class BatchRunner(QObject):
             result = generate_project(
                 item.project, self._engine, item.output_path,
                 cancel_event=item.cancel_event,
+                pause_event=self._paused,
                 progress_cb=lambda d, t: self._emit_progress(item, d, t),
                 srt_path=srt_path,
             )

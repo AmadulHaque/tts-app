@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
 
 from ..models.voice import VOICE_CATALOG, VoiceInfo, voice_info
 from ..utils import config as cfg
+from .widgets.busy import clear_busy, set_busy
 
 
 class VoiceCard(QFrame):
@@ -63,6 +64,12 @@ class VoiceCard(QFrame):
     def _on_star(self, checked: bool) -> None:
         self.star_btn.setText("★" if checked else "☆")
         self.favorite_toggled.emit(self.voice_id, checked)
+
+    def set_preview_busy(self, busy: bool) -> None:
+        if busy:
+            set_busy(self.preview_btn, "⏳ Previewing")
+        else:
+            clear_busy(self.preview_btn)
 
     def card_context_menu(self, pos) -> None:
         menu = QMenu(self)
@@ -203,6 +210,11 @@ class VoiceLibraryTab(QWidget):
         for vid, card in self._cards.items():
             card.star_btn.setChecked(vid in self._favorites)
             card.star_btn.setText("★" if vid in self._favorites else "☆")
+
+    def set_preview_busy(self, voice_id: str, busy: bool) -> None:
+        card = self._cards.get(voice_id)
+        if card is not None:
+            card.set_preview_busy(busy)
 
     # -- presets ------------------------------------------------------------
 

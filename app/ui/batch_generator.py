@@ -18,6 +18,7 @@ from ..core.batch_runner import BatchItem, BatchRunner, write_batch_report
 from ..core.project import Project
 from ..utils import paths as app_paths
 from ..utils import import_export
+from .widgets.busy import clear_busy, set_busy
 
 STATUS_COLORS = {
     "Queued": Qt.GlobalColor.gray,
@@ -78,19 +79,39 @@ class BatchGeneratorTab(QWidget):
         self.remove_btn.clicked.connect(self._remove_selected)
         self.gen_all_btn.clicked.connect(lambda: self._start(selected_only=False))
         self.gen_sel_btn.clicked.connect(lambda: self._start(selected_only=True))
-        self.pause_btn.clicked.connect(self._runner.pause)
-        self.resume_btn.clicked.connect(self._runner.resume)
-        self.cancel_btn.clicked.connect(self._runner.cancel_current)
+        self.pause_btn.clicked.connect(self._pause)
+        self.resume_btn.clicked.connect(self._resume)
+        self.cancel_btn.clicked.connect(self._cancel_batch)
         self.report_btn.clicked.connect(self._export_report)
 
         self._runner.item_progress.connect(self._on_progress)
         self._runner.item_status.connect(self._on_status)
+        self._runner.paused_changed.connect(self._on_paused_changed)
         self._runner.queue_finished.connect(self._on_queue_finished)
 
         self._refresh_buttons()
 
     def _on_queue_finished(self) -> None:
         self.status_message.emit("Batch finished")
+        self._refresh_buttons()
+
+    def _pause(self) -> None:
+        if self._runner.is_running():
+            self._runner.pause()
+            self.status_message.emit("Batch paused (finishes current line, then holds)")
+
+    def _resume(self) -> None:
+        if self._runner.is_running():
+            self._runner.resume()
+            self.status_message.emit("Batch resumed")
+
+    def _cancel_batch(self) -> None:
+        if not self._runner.is_running():
+            return
+        self._runner.stop()
+        self.status_message.emit("Batch stopped — remaining projects stay queued")
+
+    def _on_paused_changed(self, paused: bool) -> None:
         self._refresh_buttons()
 
     # -- adding items --------------------------------------------------------
@@ -172,17 +193,16 @@ class BatchGeneratorTab(QWidget):
         if not items:
             self.status_message.emit("Batch is empty — add some projects first")
             return
+        run = items
         if selected_only:
             row = self.table.currentRow()
             name_item = self.table.item(row, 0) if row >= 0 else None
             if name_item is None:
                 self.status_message.emit("No project selected")
                 return
-            items = [i for i in items if i.name == name_item.text()]
-        self._runner.set_items(items)
-        self._rebuild_table()  # keep table aligned
-        self._runner.start()
-        self.status_message.emit(f"Batch started ({len(items)} project{'s' if len(items) != 1 else ''})")
+            run = [i for i in items if i.name == name_item.text()]
+        self._runner.start(run)
+        self.status_message.emit(f"Batch started ({len(run)} project{'s' if len(run) != 1 else ''})")
 
     def _on_progress(self, name: str, done: int, total: int) -> None:
         item = self._runner.find_item(name)
@@ -230,8 +250,13 @@ class BatchGeneratorTab(QWidget):
 
     def _refresh_buttons(self) -> None:
         running = self._runner.is_running()
+        paused = running and self._runner.is_paused()
+        if running:
+            set_busy(self.gen_all_btn, "⏳ Generating")
+        else:
+            clear_busy(self.gen_all_btn)
         self.gen_all_btn.setEnabled(not running)
         self.gen_sel_btn.setEnabled(not running)
-        self.pause_btn.setEnabled(running)
-        self.resume_btn.setEnabled(running)
+        self.pause_btn.setEnabled(running and not paused)
+        self.resume_btn.setEnabled(paused)
         self.cancel_btn.setEnabled(running)

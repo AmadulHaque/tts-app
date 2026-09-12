@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
 
 from ..models.dialogue import SpeakerProfile
 from ..models.voice import VOICE_CATALOG, voice_info
+from .widgets.busy import clear_busy, set_busy
 
 VOICE_ROLE = Qt.ItemDataRole.UserRole
 
@@ -124,6 +125,12 @@ class SpeakerVoicePane(QGroupBox):
     def speaker_name(self) -> str:
         return self.name_edit.text().strip() or self._speaker.name
 
+    def set_preview_busy(self, busy: bool) -> None:
+        if busy:
+            set_busy(self.preview_btn, "⏳ Previewing")
+        else:
+            clear_busy(self.preview_btn)
+
     # -- internals --------------------------------------------------------
 
     def _set_voice(self, voice_id: str) -> None:
@@ -226,6 +233,10 @@ class VoicePanel(QWidget):
     def set_profiles(self, speaker_a: SpeakerProfile, speaker_b: SpeakerProfile) -> None:
         self.pane_a.set_profile(speaker_a)
         self.pane_b.set_profile(speaker_b)
+
+    def set_preview_busy(self, busy: bool) -> None:
+        self.pane_a.set_preview_busy(busy)
+        self.pane_b.set_preview_busy(busy)
 
     def profiles(self) -> tuple[SpeakerProfile, SpeakerProfile]:
         return self.pane_a.profile(), self.pane_b.profile()

@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QThread, Qt
+from PySide6.QtCore import QThread, QTimer, Qt
 from PySide6.QtGui import QAction, QKeySequence, QPalette
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QLabel, QMainWindow, QMenu, QMessageBox,
@@ -69,6 +69,8 @@ class MainWindow(QMainWindow):
         self._preview_workers: set = set()
         self._preview_threads: set[QThread] = set()
         self._previewer = AudioPreviewer()
+        self._preview_gen = 0
+        self._pending_preview: tuple[str, str] | None = None
 
         # Engine (lazy: loads in a background thread at startup)
         self._engine = TTSEngine(model_repo_id=self._settings.model_repo_id,
@@ -85,6 +87,7 @@ class MainWindow(QMainWindow):
         self._show_status(f"Ready — engine loading…")
 
         self._init_engine_thread()
+        QTimer.singleShot(0, self._maybe_offer_recovery)
 
     # ------------------------------------------------------------------ setup
 
@@ -339,18 +342,28 @@ class MainWindow(QMainWindow):
         if not self._engine.ready:
             self._show_status("Engine still loading — try again in a moment.")
             return
-        self._spawn_preview(PREVIEW_TEXT, voice_id, 1.0, 0.0)
+        self._spawn_preview(PREVIEW_TEXT, voice_id, 1.0, 0.0, source="library")
 
-    def _spawn_preview(self, text: str, voice_id: str, speed: float, pitch: float) -> None:
+    def _spawn_preview(self, text: str, voice_id: str, speed: float, pitch: float,
+                       source: str = "editor") -> None:
         self._previewer.stop()
+        self._clear_preview_busy()
+        self._preview_gen += 1
+        gen = self._preview_gen
+        self._pending_preview = (source, voice_id)
+        if source == "library":
+            self.library.set_preview_busy(voice_id, True)
+        else:
+            self.editor.set_preview_busy(True)
+
         worker = PreviewRunner(self._engine, text, voice_id, speed, pitch)
         thread = QThread()
         self._preview_threads.add(thread)  # see _init_engine_thread: never GC a running QThread
         self._preview_workers.add(worker)  # dead receivers silently disconnect: never GC a queued worker
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.completed.connect(self._on_preview_audio)
-        worker.failed.connect(lambda e: self._show_status(f"Preview failed: {e}"))
+        worker.completed.connect(lambda audio, g=gen: self._on_preview_audio(audio, g))
+        worker.failed.connect(lambda err, g=gen: self._on_preview_failed(err, g))
         for sig in (worker.completed, worker.failed):
             sig.connect(thread.quit)
             sig.connect(worker.deleteLater)
@@ -361,9 +374,28 @@ class MainWindow(QMainWindow):
         thread.finished.connect(lambda t=thread: _ORPHAN_THREADS.discard(t))
         thread.start()
 
-    def _on_preview_audio(self, audio) -> None:
+    def _on_preview_audio(self, audio, gen: int = -1) -> None:
+        if gen >= 0 and gen != self._preview_gen:
+            return  # stale worker: a newer preview already took over
+        self._clear_preview_busy()
         self._previewer.play_array(audio)
         self._set_audio_length(len(audio) / 24000.0)
+
+    def _on_preview_failed(self, error: str, gen: int = -1) -> None:
+        if gen >= 0 and gen != self._preview_gen:
+            return
+        self._clear_preview_busy()
+        self._show_status(f"Preview failed: {error}")
+
+    def _clear_preview_busy(self) -> None:
+        if self._pending_preview is None:
+            return
+        source, voice_id = self._pending_preview
+        self._pending_preview = None
+        if source == "library":
+            self.library.set_preview_busy(voice_id, False)
+        else:
+            self.editor.set_preview_busy(False)
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self._previewer.stop()
@@ -506,11 +538,10 @@ class MainWindow(QMainWindow):
             from ..core.tts_engine import set_engine
             set_engine(None)
             self._engine = TTSEngine(model_repo_id=settings.model_repo_id,
-                                     device=settings.device)
+                                      device=settings.device)
             self._batch_runner.set_engine(self._engine)
         self._init_engine_thread()
-        from PySide6.QtCore import QTimer as _QTimer
-        _QTimer.singleShot(0, self._maybe_offer_recovery)
+        QTimer.singleShot(0, self._maybe_offer_recovery)
         self._apply_theme(settings.theme)
         self._show_status("Settings saved")
 
