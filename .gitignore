@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build artifacts
+build/
+dist/
+*.spec.bak
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environments / secrets
+.env
+.env.*
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Models / audio output (uncomment if stored locally)
+# models/
+# output/
